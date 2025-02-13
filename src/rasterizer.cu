@@ -216,8 +216,8 @@ __global__ void render_kernel_tiled(float *means2d, float *scales, float *opacit
             {
                 continue;
             }
-            int x0 = tile_means2d[j * 2];
-            int y0 = tile_means2d[j * 2 + 1];
+            float x0 = tile_means2d[j * 2];
+            float y0 = tile_means2d[j * 2 + 1];
             float delta_x = x - x0;
             float delta_y = y - y0;
             float aa = tile_cov_inv[j * 4 + 0];
@@ -230,7 +230,7 @@ __global__ void render_kernel_tiled(float *means2d, float *scales, float *opacit
             channel[0] += T * alpha * tile_color[j * 3 + 0];
             channel[1] += T * alpha * tile_color[j * 3 + 1];
             channel[2] += T * alpha * tile_color[j * 3 + 2];
-            // channel[2] = 1.0;//tile_color[j*3 + 2];
+
             T = T * (1 - alpha);
             if (T < 0.001)
             {
@@ -252,6 +252,8 @@ __global__ void duplicate_and_assign_key_kernel(
     int *radii,
     float *K,
     int N,
+    int width,
+    int height,
     uint64_t *keys,   // Out
     uint64_t *indices // Out
 )
@@ -268,8 +270,8 @@ __global__ void duplicate_and_assign_key_kernel(
         return;
     }
 
-    int width = K[2] * 2;
-    int height = K[5] * 2;
+    // int width = K[2] * 2;
+    // int height = K[5] * 2;
     Rect rect = get_rect(means2d[idx * 2], means2d[idx * 2 + 1], radii[idx], width, height);
     int off = (idx == 0 ? 0 : offset[idx - 1]);
     for (int i = rect.y0; i < rect.y1; ++i)
@@ -392,6 +394,8 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
         radii.data_ptr<int>(),
         K.data_ptr<float>(),
         N,
+        width,
+        height,
         keys,   // Out
         indices // Out
     );
