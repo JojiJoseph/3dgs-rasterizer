@@ -62,7 +62,7 @@ __device__ float calc_radius(float cov[2][2])
     float mid = 0.5f * (cov[0][0] + cov[1][1]);
     float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
     float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-    float radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+    float radius = 1*ceil(3.f * sqrt(max(lambda1, lambda2)));
     return radius;
 }
 
@@ -97,7 +97,12 @@ __global__ void preprocess_kernel(float *means3d, float *scales, float *quats, f
     float y3 = K[3] * x2 + K[4] * y2 + K[5] * z2;
     means2d[idx * 2] = x3 / z2;
     means2d[idx * 2 + 1] = y3 / z2;
-    valid_gaussian[idx] = (z2 > 0.1) && means2d[idx * 2] >= -100 && means2d[idx * 2] < (width + 100) && means2d[idx * 2 + 1] >= -100 && means2d[idx * 2 + 1] < (height + 100);
+    valid_gaussian[idx] = (z2 > 0.01) && means2d[idx * 2] >= 0 && means2d[idx * 2] < (width) && means2d[idx * 2 + 1] >= 0 && means2d[idx * 2 + 1] < (height + 0);
+
+    // if (!valid_gaussian[idx])
+    // {
+    //     return;
+    // }
 
     float fx = K[0];
     float fy = K[4];
@@ -153,6 +158,17 @@ __global__ void preprocess_kernel(float *means3d, float *scales, float *quats, f
     ntiles[idx] = number_of_tiles_touched;
     depths[idx] = z2;
 
+    if (!valid_gaussian[idx])
+    {
+        if (ntiles[idx] < 0)
+        {
+            ntiles[idx] = 0;
+        }
+        ntiles[idx] = 0;
+        depths[idx] = 0;
+        radii[idx] = 0;
+    }
+
 }
 
 
@@ -162,15 +178,16 @@ __global__ void render_kernel_tiled(float *means2d, float *scales, float *opacit
 
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
+    bool done = false;
     if (x >= width || y >= height)
     {
-        return;
+        done = true;
     }
 
     float channel[3] = {0.0, 0.0, 0.0};
     int tile_x = x / 16;
     int tile_y = y / 16;
-    int tile_id = tile_y * (width + 15) / 16 + tile_x;
+    int tile_id = tile_y * ((width + 15) / 16) + tile_x;
     int offset = tiles_range_start[tile_id];
     int end = tiles_range_end[tile_id];
 
@@ -186,31 +203,36 @@ __global__ void render_kernel_tiled(float *means2d, float *scales, float *opacit
     for (int i = offset; i < end; i += 256)
     {
         int sorted_idx = i + threadIdx.x + threadIdx.y * 16;
-        if (sorted_idx > end)
+        tile_valid_gaussian[threadIdx.x + threadIdx.y * 16] = false;
+        if (sorted_idx < end)
         {
+            // continue;
+        // }
+            int idx = indices_sorted[sorted_idx];
+            // printf("idx: %d\n", idx);
+            tile_indices[threadIdx.x + threadIdx.y * 16] = idx;
+            tile_means2d[(threadIdx.x + threadIdx.y * 16) * 2] = means2d[idx * 2];
+            tile_means2d[(threadIdx.x + threadIdx.y * 16) * 2 + 1] = means2d[idx * 2 + 1];
+            tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4] = cov_inv[idx * 4];
+            tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4 + 1] = cov_inv[idx * 4 + 1];
+            tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4 + 2] = cov_inv[idx * 4 + 2];
+            tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4 + 3] = cov_inv[idx * 4 + 3];
+            tile_radii[threadIdx.x + threadIdx.y * 16] = radii[idx];
+            tile_color[(threadIdx.x + threadIdx.y * 16) * 3] = color[idx * 3];
+            tile_color[(threadIdx.x + threadIdx.y * 16) * 3 + 1] = color[idx * 3 + 1];
+            tile_color[(threadIdx.x + threadIdx.y * 16) * 3 + 2] = color[idx * 3 + 2];
+            tile_opacities[threadIdx.x + threadIdx.y * 16] = opacities[idx];
+            tile_valid_gaussian[threadIdx.x + threadIdx.y * 16] = valid_gaussian[idx];
+        }
+        __syncthreads();
+        if (done) {
             continue;
         }
-        int idx = indices_sorted[sorted_idx];
-        // printf("idx: %d\n", idx);
-        tile_indices[threadIdx.x + threadIdx.y * 16] = idx;
-        tile_means2d[(threadIdx.x + threadIdx.y * 16) * 2] = means2d[idx * 2];
-        tile_means2d[(threadIdx.x + threadIdx.y * 16) * 2 + 1] = means2d[idx * 2 + 1];
-        tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4] = cov_inv[idx * 4];
-        tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4 + 1] = cov_inv[idx * 4 + 1];
-        tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4 + 2] = cov_inv[idx * 4 + 2];
-        tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4 + 3] = cov_inv[idx * 4 + 3];
-        tile_radii[threadIdx.x + threadIdx.y * 16] = radii[idx];
-        tile_color[(threadIdx.x + threadIdx.y * 16) * 3] = color[idx * 3];
-        tile_color[(threadIdx.x + threadIdx.y * 16) * 3 + 1] = color[idx * 3 + 1];
-        tile_color[(threadIdx.x + threadIdx.y * 16) * 3 + 2] = color[idx * 3 + 2];
-        tile_opacities[threadIdx.x + threadIdx.y * 16] = opacities[idx];
-        tile_valid_gaussian[threadIdx.x + threadIdx.y * 16] = valid_gaussian[idx];
-        __syncthreads();
         for (int j = 0; j < 256; ++j)
         {
             if (i + j >= end)
             {
-                break;
+                continue;
             }
             if (!tile_valid_gaussian[j])
             {
@@ -224,9 +246,18 @@ __global__ void render_kernel_tiled(float *means2d, float *scales, float *opacit
             float bb = tile_cov_inv[j * 4 + 1];
             float cc = tile_cov_inv[j * 4 + 2];
             float dd = tile_cov_inv[j * 4 + 3];
-            float alpha = tile_opacities[j] * exp(-0.5 * (aa * delta_x * delta_x + bb * delta_x * delta_y + cc * delta_y * delta_x + dd * delta_y * delta_y));
+
+            float power = -0.5 * (aa * delta_x * delta_x + bb * delta_x * delta_y + cc * delta_y * delta_x + dd * delta_y * delta_y);
+            if (power > 0.0)
+            {
+                continue;
+            }
+
+            float alpha = tile_opacities[j] * exp(power);
             alpha = min(0.99f, alpha);
-            alpha = max(0.00f, alpha);
+            if (alpha < 1.0f / 255.0f)
+				continue;
+            // alpha = max(0.00f, alpha);
             channel[0] += T * alpha * tile_color[j * 3 + 0];
             channel[1] += T * alpha * tile_color[j * 3 + 1];
             channel[2] += T * alpha * tile_color[j * 3 + 2];
@@ -234,14 +265,17 @@ __global__ void render_kernel_tiled(float *means2d, float *scales, float *opacit
             T = T * (1 - alpha);
             if (T < 0.001)
             {
+                done = true;
                 break;
             }
         }
     }
-    
-    out[(y * width + x) * 3 + 0] = channel[0];
-    out[(y * width + x) * 3 + 1] = channel[1];
-    out[(y * width + x) * 3 + 2] = channel[2];
+    if (x < width && y < height)
+    {
+        out[(y * width + x) * 3 + 0] = channel[0];
+        out[(y * width + x) * 3 + 1] = channel[1];
+        out[(y * width + x) * 3 + 2] = channel[2];
+    }
 }
 
 __global__ void duplicate_and_assign_key_kernel(
@@ -278,12 +312,16 @@ __global__ void duplicate_and_assign_key_kernel(
     {
         for (int j = rect.x0; j < rect.x1; ++j)
         {
-            uint64_t key = i * (width + 15) / 16 + j;
-            key = key << 32;
-            key = key | *((uint32_t *)(&depths[idx]));
+            uint64_t key = i * ((width + 15) / 16) + j;
+            key = (key << 32);
+            key = (key | *((uint32_t *)(&depths[idx])));
             keys[off] = key;
             indices[off] = idx;
             off++;
+            if (off >= offset[idx])
+            {
+                break;
+            }
 
         }
     }
@@ -304,14 +342,14 @@ __global__ void identify_tiles_kernel(
     {
         return;
     }
-    int tile = keys_sorted[idx] >> 32;
+    unsigned int tile = keys_sorted[idx] >> 32;
     if (idx == 0)
     {
         tiles_range_start[0] = 0;
     }
     else
     {
-        int prev_tile = keys_sorted[idx - 1] >> 32;
+        unsigned int prev_tile = keys_sorted[idx - 1] >> 32;
         if (tile != prev_tile)
         {
             tiles_range_start[tile] = idx;
@@ -428,7 +466,7 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
 
     uint32_t *tiles_range_start;
     uint32_t *tiles_range_end;
-    int n_tiles = (width + 15) / 16 * (height + 15) / 16;
+    int n_tiles = ((width + 15) / 16) * ((height + 15) / 16);
     cudaMalloc(&tiles_range_start, n_tiles * sizeof(uint32_t));
     cudaMalloc(&tiles_range_end, n_tiles * sizeof(uint32_t));
 
