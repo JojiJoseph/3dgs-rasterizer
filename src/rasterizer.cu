@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 #include <cub/cub.cuh>
 
-__device__ void matmul(float *A, float *B, float *C, int m, int n, int k)
+__forceinline__ __device__ void matmul(float *A, float *B, float *C, int m, int n, int k)
 {
     for (int i = 0; i < m; i++)
     {
@@ -17,7 +17,7 @@ __device__ void matmul(float *A, float *B, float *C, int m, int n, int k)
     }
 }
 
-__device__ void transpose(float *A, float *B, int m, int n)
+__forceinline__ __device__ void transpose(float *A, float *B, int m, int n)
 {
     for (int i = 0; i < m; i++)
     {
@@ -28,7 +28,7 @@ __device__ void transpose(float *A, float *B, int m, int n)
     }
 }
 
-__device__ float *calc_cov3d(float *scale, float *quat)
+__forceinline__ __device__  float *calc_cov3d(const float * __restrict__ scale, float * __restrict__ quat)
 {
     float q0 = quat[0];
     float q1 = quat[1];
@@ -56,7 +56,7 @@ __device__ float *calc_cov3d(float *scale, float *quat)
     return cov3d;
 }
 
-__device__ float calc_radius(float cov[2][2])
+__device__ float calc_radius(const float cov[2][2])
 {
     float det = cov[0][0] * cov[1][1] - cov[0][1] * cov[1][0];
     float mid = 0.5f * (cov[0][0] + cov[1][1]);
@@ -71,8 +71,13 @@ struct Rect
     int x0, y0, x1, y1;
 };
 
-__device__ Rect get_rect(int x, int y, int radius, int width, int height)
+__forceinline__ __device__ Rect get_rect(const int x, const int y, const int radius, const int width, const int height)
 {
+    /*
+    This function will give the rectangle of the tiles that are touched by the gaussian
+    x0, y0 is the top left corner of the rectangle
+    x1, y1 is the bottom right corner of the rectangle
+    */
     int x0 = min((width + 15) / 16, max(0, (int)((x - radius) / 16)));
     int x1 = min((width + 15) / 16, max(0, (int)((x + radius + 15) / 16)));
     int y0 = min((height + 15) / 16, max(0, (int)((y - radius) / 16)));
@@ -80,7 +85,7 @@ __device__ Rect get_rect(int x, int y, int radius, int width, int height)
     return {x0, y0, x1, y1};
 }
 
-__global__ void preprocess_kernel(float *means3d, float *scales, float *quats, float *viewmat, float *K, float *means2d, bool *valid_gaussian, float *cov_inv, int *radii, int *ntiles, float *depths, int N, int width, int height)
+__global__ void preprocess_kernel(const float * __restrict__ means3d, const float * __restrict__ scales, const float * __restrict__ quats, const float * __restrict__ viewmat, const float * __restrict__ K, float * __restrict__ means2d, bool * __restrict__ valid_gaussian, float * __restrict__ cov_inv, int *__restrict__ radii, int * __restrict__ ntiles, float * __restrict__ depths, const int N, const int width, const int height)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N)
@@ -173,15 +178,17 @@ __global__ void preprocess_kernel(float *means3d, float *scales, float *quats, f
 
 
 
-__global__ void render_kernel_tiled(float *means2d, float *scales, float *opacities, float *color, bool *valid_gaussian, float *cov_inv, int *radii, float *out, uint32_t *tiles_range_start, uint32_t *tiles_range_end, uint64_t *indices_sorted, int width, int height, int N)
+__global__ void __launch_bounds__(256) render_kernel_tiled(const float  * __restrict__ means2d, const float  * __restrict__ scales, const float   * __restrict__ opacities, const float  * __restrict__ color, const bool * __restrict__ valid_gaussian, const float  * __restrict__ cov_inv, const int  * __restrict__ radii, float * __restrict__ out, const uint32_t  * __restrict__ tiles_range_start, const uint32_t * __restrict__ tiles_range_end, const uint64_t * __restrict__ indices_sorted, const int width, const int height, const int N)
 {
 
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     bool done = false;
+    bool inside = true;
     if (x >= width || y >= height)
     {
         done = true;
+        inside = false;
     }
 
     float channel[3] = {0.0, 0.0, 0.0};
@@ -202,6 +209,10 @@ __global__ void render_kernel_tiled(float *means2d, float *scales, float *opacit
     float T = 1.0;
     for (int i = offset; i < end; i += 256)
     {
+        if (256 == __syncthreads_count(done))
+        {
+            break;
+        }
         int sorted_idx = i + threadIdx.x + threadIdx.y * 16;
         tile_valid_gaussian[threadIdx.x + threadIdx.y * 16] = false;
         if (sorted_idx < end)
@@ -210,21 +221,22 @@ __global__ void render_kernel_tiled(float *means2d, float *scales, float *opacit
         // }
             int idx = indices_sorted[sorted_idx];
             // printf("idx: %d\n", idx);
-            tile_indices[threadIdx.x + threadIdx.y * 16] = idx;
-            tile_means2d[(threadIdx.x + threadIdx.y * 16) * 2] = means2d[idx * 2];
-            tile_means2d[(threadIdx.x + threadIdx.y * 16) * 2 + 1] = means2d[idx * 2 + 1];
-            tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4] = cov_inv[idx * 4];
-            tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4 + 1] = cov_inv[idx * 4 + 1];
-            tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4 + 2] = cov_inv[idx * 4 + 2];
-            tile_cov_inv[(threadIdx.x + threadIdx.y * 16) * 4 + 3] = cov_inv[idx * 4 + 3];
-            tile_radii[threadIdx.x + threadIdx.y * 16] = radii[idx];
-            tile_color[(threadIdx.x + threadIdx.y * 16) * 3] = color[idx * 3];
-            tile_color[(threadIdx.x + threadIdx.y * 16) * 3 + 1] = color[idx * 3 + 1];
-            tile_color[(threadIdx.x + threadIdx.y * 16) * 3 + 2] = color[idx * 3 + 2];
-            tile_opacities[threadIdx.x + threadIdx.y * 16] = opacities[idx];
-            tile_valid_gaussian[threadIdx.x + threadIdx.y * 16] = valid_gaussian[idx];
+            const int base_idx = threadIdx.x + threadIdx.y * 16;
+            tile_indices[base_idx] = idx;
+            tile_means2d[(base_idx) * 2] = means2d[idx * 2];
+            tile_means2d[(base_idx) * 2 + 1] = means2d[idx * 2 + 1];
+            tile_cov_inv[(base_idx) * 4] = cov_inv[idx * 4];
+            tile_cov_inv[(base_idx) * 4 + 1] = cov_inv[idx * 4 + 1];
+            tile_cov_inv[(base_idx) * 4 + 2] = cov_inv[idx * 4 + 2];
+            tile_cov_inv[(base_idx) * 4 + 3] = cov_inv[idx * 4 + 3];
+            tile_radii[base_idx] = radii[idx];
+            tile_color[(base_idx) * 3] = color[idx * 3];
+            tile_color[(base_idx) * 3 + 1] = color[idx * 3 + 1];
+            tile_color[(base_idx) * 3 + 2] = color[idx * 3 + 2];
+            tile_opacities[base_idx] = opacities[idx];
+            tile_valid_gaussian[base_idx] = valid_gaussian[idx];
         }
-        __syncthreads();
+        __syncthreads();    
         if (done) {
             continue;
         }
@@ -263,14 +275,14 @@ __global__ void render_kernel_tiled(float *means2d, float *scales, float *opacit
             channel[2] += T * alpha * tile_color[j * 3 + 2];
 
             T = T * (1 - alpha);
-            if (T < 0.001)
+            if (T < 0.0001)
             {
                 done = true;
                 break;
             }
         }
     }
-    if (x < width && y < height)
+    if (inside)
     {
         out[(y * width + x) * 3 + 0] = channel[0];
         out[(y * width + x) * 3 + 1] = channel[1];
@@ -279,21 +291,21 @@ __global__ void render_kernel_tiled(float *means2d, float *scales, float *opacit
 }
 
 __global__ void duplicate_and_assign_key_kernel(
-    uint32_t *offset,
-    float *means2d,
-    float *depths,
-    float *viewmat,
-    int *radii,
-    float *K,
-    int N,
-    int width,
-    int height,
-    uint64_t *keys,   // Out
-    uint64_t *indices // Out
+    const uint32_t * __restrict__ offset,
+    const float *__restrict__ means2d,
+    const float *__restrict__ depths,
+    const float *__restrict__ viewmat,
+    const int *__restrict__ radii,
+    const float *__restrict__ K,
+    const int N,
+    const int width,
+    const int height,
+    uint64_t *__restrict__ keys,   // Out
+    uint64_t *__restrict__ indices // Out
 )
 {
-    uint32_t total_indices = offset[N - 1];
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total_indices = offset[N - 1];
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx >= N)
     {
@@ -328,13 +340,13 @@ __global__ void duplicate_and_assign_key_kernel(
 }
 
 __global__ void identify_tiles_kernel(
-    uint64_t *keys_sorted,
-    uint64_t *indices_sorted,
-    uint32_t total_keys,
-    uint32_t *tiles_range_start,
-    uint32_t *tiles_range_end,
-    int width,
-    int height)
+    const uint64_t * __restrict__ keys_sorted,
+    const uint64_t *__restrict__ indices_sorted,
+    const uint32_t total_keys,
+    uint32_t *__restrict__  tiles_range_start,
+    uint32_t *__restrict__ tiles_range_end,
+    const int width,
+    const int height)
 {
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
