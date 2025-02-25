@@ -1,34 +1,41 @@
 #include <torch/extension.h>
 #include <cub/cub.cuh>
 
-__forceinline__ __device__ void matmul(float *A, float *B, float *C, int m, int n, int k)
+template <int M, int N, int K>
+__forceinline__ __device__ void matmul(float *A, float *B, float *C)
 {
-    for (int i = 0; i < m; i++)
+    #pragma unroll
+    for (int i = 0; i < M; i++)
     {
-        for (int j = 0; j < k; j++)
+        #pragma unroll
+        for (int j = 0; j < K; j++)
         {
             float sum = 0;
-            for (int l = 0; l < n; l++)
+            #pragma unroll
+            for (int l = 0; l < N; l++)
             {
-                sum += A[i * n + l] * B[l * k + j];
+                sum += A[i * N + l] * B[l * K + j];
             }
-            C[i * k + j] = sum;
+            C[i * K + j] = sum;
         }
     }
 }
 
-__forceinline__ __device__ void transpose(float *A, float *B, int m, int n)
+template <int M, int N>
+__forceinline__ __device__ void transpose(float *A, float *B)//, int m, int n)
 {
-    for (int i = 0; i < m; i++)
+    #pragma unroll
+    for (int i = 0; i < M; i++)
     {
-        for (int j = 0; j < n; j++)
+        #pragma unroll
+        for (int j = 0; j < N; j++)
         {
-            B[j * m + i] = A[i * n + j];
+            B[j * M + i] = A[i * N + j];
         }
     }
 }
 
-__forceinline__ __device__  float *calc_cov3d(const float * __restrict__ scale, float * __restrict__ quat)
+__forceinline__ __device__  void calc_cov3d(const float * __restrict__ scale, float * __restrict__ quat, float * __restrict__ cov3d)
 {
     float q0 = quat[0];
     float q1 = quat[1];
@@ -48,12 +55,13 @@ __forceinline__ __device__  float *calc_cov3d(const float * __restrict__ scale, 
         {0, 0, scale[2]}};
 
     float RS[3][3];
-    matmul((float *)R, (float *)S, (float *)RS, 3, 3, 3);
+    matmul<3,3,3>((float *)R, (float *)S, (float *)RS);
     float RST[3][3];
-    transpose((float *)RS, (float *)RST, 3, 3);
-    float *cov3d = new float[9];
-    matmul((float *)RS, (float *)RST, (float *)cov3d, 3, 3, 3);
-    return cov3d;
+    transpose<3,3>((float *)RS, (float *)RST);
+    // float *cov3d = new float[9];
+    // float cov3d[3][3];
+    matmul<3,3,3>((float *)RS, (float *)RST, (float *)cov3d);
+    // return (float*)cov3d;
 }
 
 __device__ float calc_radius(const float cov[2][2])
@@ -114,7 +122,8 @@ __global__ void preprocess_kernel(const float * __restrict__ means3d, const floa
 
     float scale[3] = {scales[idx * 3 + 0], scales[idx * 3 + 1], scales[idx * 3 + 2]};
     float quat[4] = {quats[idx * 4], quats[idx * 4 + 1], quats[idx * 4 + 2], quats[idx * 4 + 3]};
-    float *cov3D = calc_cov3d(scale, quat);
+    float cov3d[3][3];
+    calc_cov3d(scale, quat, (float*)cov3d);
 
     float J[2][3] = {
         {fx / z2, 0, -fx * x2 / (z2 * z2)},
@@ -126,21 +135,21 @@ __global__ void preprocess_kernel(const float * __restrict__ means3d, const floa
         {viewmat[8], viewmat[9], viewmat[10]}};
 
     float WT[3][3];
-    transpose((float *)W, (float *)WT, 3, 3);
+    transpose<3,3>((float *)W, (float *)WT);
     float JT[3][2];
-    transpose((float *)J, (float *)JT, 2, 3);
+    transpose<2,3>((float *)J, (float *)JT);
 
     float WJT[3][2];
-    matmul((float *)WT, (float *)JT, (float *)WJT, 3, 3, 2);
+    matmul<3,3,2>((float *)WT, (float *)JT, (float *)WJT);
     float JW[2][3];
-    matmul((float *)J, (float *)W, (float *)JW, 2, 3, 3);
+    matmul<2,3,3>((float *)J, (float *)W, (float *)JW);
 
     float JWCov[2][3];
-    matmul((float *)JW, (float *)cov3D, (float *)JWCov, 2, 3, 3);
+    matmul<2,3,3>((float *)JW, (float *)cov3d, (float *)JWCov);
 
     float cov[2][2];
-    matmul((float *)JWCov, (float *)WJT, (float *)cov, 2, 3, 2);
-    delete cov3D;
+    matmul<2,3,2>((float *)JWCov, (float *)WJT, (float *)cov);
+    // delete cov3D;
 
     cov[0][0] += 0.3f;
     cov[1][1] += 0.3f;
@@ -376,6 +385,9 @@ __global__ void identify_tiles_kernel(
 
 torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor colors, torch::Tensor opacities, torch::Tensor scales, torch::Tensor viewmat, torch::Tensor K, int width, int height)
 {
+
+    
+
     int N = means3d.size(0);
     // int threads = 1024;
     // int blocks = (N + threads - 1) / threads;
@@ -390,7 +402,9 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
     torch::Tensor ntiles = torch::zeros({N}, torch::kInt).cuda();
     torch::Tensor depths = torch::zeros({N}).cuda();
 
-    preprocess_kernel<<<(N + threads - 1) / threads, threads>>>(
+    
+
+    preprocess_kernel<<<(N + 16 - 1) / 16, 16>>>(
         means3d.data_ptr<float>(),
         scales.data_ptr<float>(),
         quats.data_ptr<float>(),
@@ -405,6 +419,8 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
         N,
         width,
         height);
+
+    
 
     uint32_t *offset;
     int *d_temp_storage;
@@ -435,7 +451,7 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
 
     cudaMalloc(&indices, (*total_keys) * sizeof(uint64_t));
 
-
+    
     duplicate_and_assign_key_kernel<<<(N + 1023) / 1024, 1024>>>(
         offset,
         means2d.data_ptr<float>(),
@@ -449,6 +465,8 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
         keys,   // Out
         indices // Out
     );
+
+    
 
     uint64_t *keys_sorted;
     uint64_t *indices_sorted;
@@ -465,6 +483,7 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
         indices_sorted,
         *total_keys);
     // Allocate temporary storage
+    cudaFree(d_temp_storage);
     cudaMalloc(&d_temp_storage, temp_storage_bytes);
     // Sort the keys and indices
     cub::DeviceRadixSort::SortPairs(
@@ -482,6 +501,13 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
     cudaMalloc(&tiles_range_start, n_tiles * sizeof(uint32_t));
     cudaMalloc(&tiles_range_end, n_tiles * sizeof(uint32_t));
 
+
+    // cudaEvent_t start, stop;
+    // cudaEventCreate(&start);
+    // cudaEventCreate(&stop);
+
+    // cudaEventRecord(start, 0);
+
     identify_tiles_kernel<<<((*total_keys) + 1023) / 1024, 1024>>>(
         keys_sorted,
         indices_sorted,
@@ -492,11 +518,22 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
         height);
 
 
+    // cudaEventRecord(stop, 0);
+
+    // cudaEventSynchronize(stop);
+    // float elapsedTime;
+    // cudaEventElapsedTime(&elapsedTime, start, stop);
+    // printf("Identify tiles kernel execution time: %f ms\n", elapsedTime);
+
+
 
     torch::Tensor out = torch::zeros({height, width, 3}).cuda();
 
 
     out = out.to(torch::kFloat32);
+
+    
+
 
     render_kernel_tiled<<<blocks, threads2>>>(
         means2d.data_ptr<float>(),
@@ -513,5 +550,20 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
         width,
         height,
         N);
+
+    
+
+    // cudaEventDestroy(start);
+    // cudaEventDestroy(stop);
+
+    cudaFree(offset);
+    cudaFree(d_temp_storage);
+    cudaFree(keys);
+    cudaFree(indices);
+    cudaFree(keys_sorted);
+    cudaFree(indices_sorted);
+    cudaFree(tiles_range_start);
+    cudaFree(tiles_range_end);
+
     return out;
 }
