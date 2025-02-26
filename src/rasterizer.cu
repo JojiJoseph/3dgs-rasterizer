@@ -191,7 +191,7 @@ __global__ void preprocess_kernel(const float3 * __restrict__ means3d, const flo
 
 
 
-__global__ void __launch_bounds__(256) render_kernel_tiled(const float2  * __restrict__ means2d, const float   * __restrict__ opacities, const float3  * __restrict__ color, const bool * __restrict__ valid_gaussian, const float4  * __restrict__ cov_inv, const int  * __restrict__ radii, float3 * __restrict__ out, const uint32_t  * __restrict__ tiles_range_start, const uint32_t * __restrict__ tiles_range_end, const uint64_t * __restrict__ indices_sorted, const int width, const int height, const int N)
+__global__ void __launch_bounds__(256) render_kernel_tiled(const float2  * __restrict__ means2d, const float   * __restrict__ opacities, const float3  * __restrict__ color, const bool * __restrict__ valid_gaussian, const float4  * __restrict__ cov_inv, const int  * __restrict__ radii, float3 * __restrict__ out, const uint32_t  * __restrict__ tiles_range_start, const uint32_t * __restrict__ tiles_range_end, const uint32_t * __restrict__ indices_sorted, const int width, const int height, const int N)
 {
 
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -284,7 +284,7 @@ __global__ void __launch_bounds__(256) render_kernel_tiled(const float2  * __res
                 continue;
             }
 
-            float alpha = tile_opacities[j] * exp(power);
+            float alpha = tile_opacities[j] * __expf(power);
             alpha = min(0.99f, alpha);
             if (alpha < 1.0f / 255.0f)
 				continue;
@@ -321,7 +321,7 @@ __global__ void duplicate_and_assign_key_kernel(
     const int width,
     const int height,
     uint64_t *__restrict__ keys,   // Out
-    uint64_t *__restrict__ indices // Out
+    uint32_t *__restrict__ indices // Out
 )
 {
     const uint32_t total_indices = offset[N - 1];
@@ -361,7 +361,7 @@ __global__ void duplicate_and_assign_key_kernel(
 
 __global__ void identify_tiles_kernel(
     const uint64_t * __restrict__ keys_sorted,
-    const uint64_t *__restrict__ indices_sorted,
+    const uint32_t *__restrict__ indices_sorted,
     const uint32_t total_keys,
     uint32_t *__restrict__  tiles_range_start,
     uint32_t *__restrict__ tiles_range_end,
@@ -406,12 +406,16 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
     dim3 blocks((width + threads - 1) / threads, (height + threads - 1) / threads);
     dim3 threads2(threads, threads);
 
-    torch::Tensor means2d = torch::zeros({N, 2}).cuda();
+    torch::Tensor means2d = torch::empty({N, 2},torch::device(torch::kCUDA).dtype(torch::kFloat32));
     torch::Tensor valid_gaussian = torch::zeros({N}, torch::kBool).cuda();
-    torch::Tensor cov_inv = torch::zeros({N, 4}).cuda();
-    torch::Tensor radii = torch::zeros({N}, torch::kInt).cuda();
-    torch::Tensor ntiles = torch::zeros({N}, torch::kInt).cuda();
-    torch::Tensor depths = torch::zeros({N}).cuda();
+    // torch::Tensor cov_inv = torch::zeros({N, 4}).cuda();
+    torch::Tensor cov_inv = torch::empty({N, 4},torch::device(torch::kCUDA).dtype(torch::kFloat32));
+    // torch::Tensor radii = torch::zeros({N}, torch::kInt).cuda();
+    torch::Tensor radii = torch::empty({N},torch::device(torch::kCUDA).dtype(torch::kInt));
+    // torch::Tensor ntiles = torch::zeros({N}, torch::kInt).cuda();
+    torch::Tensor ntiles = torch::empty({N},torch::device(torch::kCUDA).dtype(torch::kInt));
+    // torch::Tensor depths = torch::zeros({N}).cuda();
+    torch::Tensor depths = torch::empty({N},torch::device(torch::kCUDA).dtype(torch::kFloat32));
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -469,9 +473,9 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
     uint32_t *total_keys = new uint32_t;
     cudaMemcpy(total_keys, offset + N - 1, sizeof(uint32_t), cudaMemcpyDeviceToHost);
     cudaMalloc(&keys, (*total_keys) * sizeof(uint64_t));
-    uint64_t *indices;
+    uint32_t *indices;
 
-    cudaMalloc(&indices, (*total_keys) * sizeof(uint64_t));
+    cudaMalloc(&indices, (*total_keys) * sizeof(uint32_t));
 
     
     duplicate_and_assign_key_kernel<<<(N + 1023) / 1024, 1024>>>(
@@ -491,9 +495,16 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
     
 
     uint64_t *keys_sorted;
-    uint64_t *indices_sorted;
+    uint32_t *indices_sorted;
     cudaMalloc(&keys_sorted, (*total_keys) * sizeof(uint64_t));
-    cudaMalloc(&indices_sorted, (*total_keys) * sizeof(uint64_t));
+    cudaMalloc(&indices_sorted, (*total_keys) * sizeof(uint32_t));
+
+    uint32_t n_keys = *total_keys;
+    int bit = 0;
+    while (n_keys >>= 1)
+    {
+        bit++;
+    }
 
     // Sort the keys and indices
     cub::DeviceRadixSort::SortPairs(
@@ -503,7 +514,8 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
         keys_sorted,
         indices,
         indices_sorted,
-        *total_keys);
+        *total_keys,
+        0, 32+bit);
     // Allocate temporary storage
     cudaFree(d_temp_storage);
     cudaMalloc(&d_temp_storage, temp_storage_bytes);
@@ -515,7 +527,7 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
         keys_sorted,
         indices,
         indices_sorted,
-        *total_keys);
+        *total_keys,0, 32+bit);
 
     uint32_t *tiles_range_start;
     uint32_t *tiles_range_end;
@@ -549,10 +561,11 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
 
 
 
-    torch::Tensor out = torch::zeros({height, width, 3}).cuda();
+    // torch::Tensor out = torch::zeros({height, width, 3}, torch::kFloat32).cuda();
+    torch::Tensor out = torch::empty({height, width, 3},torch::device(torch::kCUDA).dtype(torch::kFloat32));
 
 
-    out = out.to(torch::kFloat32);
+    // out = out.to(torch::kFloat32);
 
     cudaEvent_t start2, stop2;
     cudaEventCreate(&start2);
