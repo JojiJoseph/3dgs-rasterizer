@@ -21,6 +21,8 @@ __forceinline__ __device__ void matmul(float *A, float *B, float *C)
     }
 }
 
+using float9 = float[9];
+
 template <int M, int N>
 __forceinline__ __device__ void transpose(float *A, float *B)//, int m, int n)
 {
@@ -93,16 +95,17 @@ __forceinline__ __device__ Rect get_rect(const int x, const int y, const int rad
     return {x0, y0, x1, y1};
 }
 
-__global__ void preprocess_kernel(const float * __restrict__ means3d, const float * __restrict__ scales, const float * __restrict__ quats, const float * __restrict__ viewmat, const float * __restrict__ K, float * __restrict__ means2d, bool * __restrict__ valid_gaussian, float * __restrict__ cov_inv, int *__restrict__ radii, int * __restrict__ ntiles, float * __restrict__ depths, const int N, const int width, const int height)
+__global__ void preprocess_kernel(const float3 * __restrict__ means3d, const float3 * __restrict__ scales, const float4 * __restrict__ quats, const float * __restrict__ viewmat, const float * __restrict__ K, float * __restrict__ means2d, bool * __restrict__ valid_gaussian, float * __restrict__ cov_inv, int *__restrict__ radii, int * __restrict__ ntiles, float * __restrict__ depths, const int N, const int width, const int height)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N)
     {
         return;
     }
-    float x = means3d[idx * 3];
-    float y = means3d[idx * 3 + 1];
-    float z = means3d[idx * 3 + 2];
+    float3 means3d_current = means3d[idx];
+    float x = means3d_current.x;
+    float y = means3d_current.y;
+    float z = means3d_current.z;
     float x2 = viewmat[0] * x + viewmat[1] * y + viewmat[2] * z + viewmat[3];
     float y2 = viewmat[4] * x + viewmat[5] * y + viewmat[6] * z + viewmat[7];
     float z2 = viewmat[8] * x + viewmat[9] * y + viewmat[10] * z + viewmat[11];
@@ -120,8 +123,9 @@ __global__ void preprocess_kernel(const float * __restrict__ means3d, const floa
     float fx = K[0];
     float fy = K[4];
 
-    float scale[3] = {scales[idx * 3 + 0], scales[idx * 3 + 1], scales[idx * 3 + 2]};
-    float quat[4] = {quats[idx * 4], quats[idx * 4 + 1], quats[idx * 4 + 2], quats[idx * 4 + 3]};
+    float scale[3] = {scales[idx].x, scales[idx].y, scales[idx].z};
+    // float quat[4] = {quats[idx * 4], quats[idx * 4 + 1], quats[idx * 4 + 2], quats[idx * 4 + 3]};
+    float quat[4] = {quats[idx].x, quats[idx].y, quats[idx].z, quats[idx].w};
     float cov3d[3][3];
     calc_cov3d(scale, quat, (float*)cov3d);
 
@@ -187,7 +191,7 @@ __global__ void preprocess_kernel(const float * __restrict__ means3d, const floa
 
 
 
-__global__ void __launch_bounds__(256) render_kernel_tiled(const float  * __restrict__ means2d, const float  * __restrict__ scales, const float   * __restrict__ opacities, const float  * __restrict__ color, const bool * __restrict__ valid_gaussian, const float  * __restrict__ cov_inv, const int  * __restrict__ radii, float * __restrict__ out, const uint32_t  * __restrict__ tiles_range_start, const uint32_t * __restrict__ tiles_range_end, const uint64_t * __restrict__ indices_sorted, const int width, const int height, const int N)
+__global__ void __launch_bounds__(256) render_kernel_tiled(const float2  * __restrict__ means2d, const float   * __restrict__ opacities, const float3  * __restrict__ color, const bool * __restrict__ valid_gaussian, const float4  * __restrict__ cov_inv, const int  * __restrict__ radii, float3 * __restrict__ out, const uint32_t  * __restrict__ tiles_range_start, const uint32_t * __restrict__ tiles_range_end, const uint64_t * __restrict__ indices_sorted, const int width, const int height, const int N)
 {
 
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -209,10 +213,10 @@ __global__ void __launch_bounds__(256) render_kernel_tiled(const float  * __rest
 
 
     __shared__ int tile_indices[256];
-    __shared__ float tile_means2d[256 * 2];
-    __shared__ float tile_cov_inv[256 * 4];
+    __shared__ float2 tile_means2d[256];
+    __shared__ float4 tile_cov_inv[256];
     __shared__ int tile_radii[256];
-    __shared__ float tile_color[256 * 3];
+    __shared__ float3 tile_color[256];
     __shared__ float tile_opacities[256];
     __shared__ bool tile_valid_gaussian[256];
     float T = 1.0;
@@ -232,16 +236,18 @@ __global__ void __launch_bounds__(256) render_kernel_tiled(const float  * __rest
             // printf("idx: %d\n", idx);
             const int base_idx = threadIdx.x + threadIdx.y * 16;
             tile_indices[base_idx] = idx;
-            tile_means2d[(base_idx) * 2] = means2d[idx * 2];
-            tile_means2d[(base_idx) * 2 + 1] = means2d[idx * 2 + 1];
-            tile_cov_inv[(base_idx) * 4] = cov_inv[idx * 4];
-            tile_cov_inv[(base_idx) * 4 + 1] = cov_inv[idx * 4 + 1];
-            tile_cov_inv[(base_idx) * 4 + 2] = cov_inv[idx * 4 + 2];
-            tile_cov_inv[(base_idx) * 4 + 3] = cov_inv[idx * 4 + 3];
+            tile_means2d[base_idx] = means2d[idx];
+            // tile_means2d[(base_idx) * 2 + 1] = means2d[idx * 2 + 1];
+            // tile_cov_inv[(base_idx) * 4] = cov_inv[idx * 4];
+            // tile_cov_inv[(base_idx) * 4 + 1] = cov_inv[idx * 4 + 1];
+            // tile_cov_inv[(base_idx) * 4 + 2] = cov_inv[idx * 4 + 2];
+            // tile_cov_inv[(base_idx) * 4 + 3] = cov_inv[idx * 4 + 3];
+            tile_cov_inv[base_idx] = cov_inv[idx];
             tile_radii[base_idx] = radii[idx];
-            tile_color[(base_idx) * 3] = color[idx * 3];
-            tile_color[(base_idx) * 3 + 1] = color[idx * 3 + 1];
-            tile_color[(base_idx) * 3 + 2] = color[idx * 3 + 2];
+            // tile_color[(base_idx) * 3] = color[idx * 3];
+            // tile_color[(base_idx) * 3 + 1] = color[idx * 3 + 1];
+            // tile_color[(base_idx) * 3 + 2] = color[idx * 3 + 2];
+            tile_color[base_idx] = color[idx];
             tile_opacities[base_idx] = opacities[idx];
             tile_valid_gaussian[base_idx] = valid_gaussian[idx];
         }
@@ -259,14 +265,18 @@ __global__ void __launch_bounds__(256) render_kernel_tiled(const float  * __rest
             {
                 continue;
             }
-            float x0 = tile_means2d[j * 2];
-            float y0 = tile_means2d[j * 2 + 1];
+            float x0 = tile_means2d[j].x;
+            float y0 = tile_means2d[j].y;
             float delta_x = x - x0;
             float delta_y = y - y0;
-            float aa = tile_cov_inv[j * 4 + 0];
-            float bb = tile_cov_inv[j * 4 + 1];
-            float cc = tile_cov_inv[j * 4 + 2];
-            float dd = tile_cov_inv[j * 4 + 3];
+            // float aa = tile_cov_inv[j * 4 + 0];
+            // float bb = tile_cov_inv[j * 4 + 1];
+            // float cc = tile_cov_inv[j * 4 + 2];
+            // float dd = tile_cov_inv[j * 4 + 3];
+            float aa = tile_cov_inv[j].x;
+            float bb = tile_cov_inv[j].y;
+            float cc = tile_cov_inv[j].z;
+            float dd = tile_cov_inv[j].w;
 
             float power = -0.5 * (aa * delta_x * delta_x + bb * delta_x * delta_y + cc * delta_y * delta_x + dd * delta_y * delta_y);
             if (power > 0.0)
@@ -279,9 +289,9 @@ __global__ void __launch_bounds__(256) render_kernel_tiled(const float  * __rest
             if (alpha < 1.0f / 255.0f)
 				continue;
             // alpha = max(0.00f, alpha);
-            channel[0] += T * alpha * tile_color[j * 3 + 0];
-            channel[1] += T * alpha * tile_color[j * 3 + 1];
-            channel[2] += T * alpha * tile_color[j * 3 + 2];
+            channel[0] += T * alpha * tile_color[j].x;
+            channel[1] += T * alpha * tile_color[j].y;
+            channel[2] += T * alpha * tile_color[j].z;
 
             T = T * (1 - alpha);
             if (T < 0.0001)
@@ -293,9 +303,10 @@ __global__ void __launch_bounds__(256) render_kernel_tiled(const float  * __rest
     }
     if (inside)
     {
-        out[(y * width + x) * 3 + 0] = channel[0];
-        out[(y * width + x) * 3 + 1] = channel[1];
-        out[(y * width + x) * 3 + 2] = channel[2];
+        // out[(y * width + x)].x = channel[0];
+        // out[(y * width + x)].y = channel[1];
+        // out[(y * width + x)].z = channel[2];
+        out[y*width+x] = {channel[0], channel[1], channel[2]};
     }
 }
 
@@ -402,12 +413,16 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
     torch::Tensor ntiles = torch::zeros({N}, torch::kInt).cuda();
     torch::Tensor depths = torch::zeros({N}).cuda();
 
-    
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-    preprocess_kernel<<<(N + 16 - 1) / 16, 16>>>(
-        means3d.data_ptr<float>(),
-        scales.data_ptr<float>(),
-        quats.data_ptr<float>(),
+    cudaEventRecord(start, 0);
+
+    preprocess_kernel<<<(N + 256 - 1) / 256, 256>>>(
+        (float3*)means3d.data_ptr<float>(),
+        (float3*)scales.data_ptr<float>(),
+        (float4*)quats.data_ptr<float>(),
         viewmat.data_ptr<float>(),
         K.data_ptr<float>(),
         means2d.data_ptr<float>(),
@@ -419,6 +434,13 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
         N,
         width,
         height);
+
+    cudaEventRecord(stop, 0);
+
+    cudaEventSynchronize(stop);
+    float elapsedTime;
+    cudaEventElapsedTime(&elapsedTime, start, stop);
+    printf("preprocess kernel execution time: %f ms\n", elapsedTime);
 
     
 
@@ -532,24 +554,35 @@ torch::Tensor render(torch::Tensor means3d, torch::Tensor quats, torch::Tensor c
 
     out = out.to(torch::kFloat32);
 
-    
+    cudaEvent_t start2, stop2;
+    cudaEventCreate(&start2);
+    cudaEventCreate(&stop2);
+
+    cudaEventRecord(start2, 0);
 
 
     render_kernel_tiled<<<blocks, threads2>>>(
-        means2d.data_ptr<float>(),
-        scales.data_ptr<float>(),
+        (float2*)means2d.data_ptr<float>(),
         opacities.data_ptr<float>(),
-        colors.data_ptr<float>(),
+        (float3*)colors.data_ptr<float>(),
         valid_gaussian.data_ptr<bool>(),
-        cov_inv.data_ptr<float>(),
+        (float4*)cov_inv.data_ptr<float>(),
         radii.data_ptr<int>(),
-        out.data_ptr<float>(),
+        (float3*)out.data_ptr<float>(),
         tiles_range_start,
         tiles_range_end,
         indices_sorted,
         width,
         height,
         N);
+
+    cudaEventRecord(stop2, 0);
+
+    cudaEventSynchronize(stop2);
+
+    cudaEventElapsedTime(&elapsedTime, start2, stop2);
+
+    printf("Render kernel execution time: %f ms\n", elapsedTime);
 
     
 
